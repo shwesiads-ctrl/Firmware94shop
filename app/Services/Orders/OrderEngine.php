@@ -160,7 +160,41 @@ class OrderEngine
         $order->recordEvent('sent_to_supplier', ['supplier' => $supplier->slug]);
 
         $payload = array_merge($inputs, ['service_ref' => $mapping->supplier_service_ref]);
-        $result = $adapter->placeOrder($payload);
+
+        // AUDIT FIX (BUG-010, P0, Phase 2.2): $adapter->placeOrder() can
+        // throw — every "live" supplier stub adapter in this repo does so
+        // unconditionally today (no real supplier docs yet), and any real
+        // HTTP-based adapter can throw on a connection failure, timeout, or
+        // malformed response. Previously nothing here caught that: the
+        // wallet debit above (already committed, in its own transaction)
+        // stood, the order was left at STATUS_SENT_TO_SUPPLIER forever, and
+        // ReconcileUnknownSupplierOrders only ever looks at
+        // STATUS_UNKNOWN orders — so a thrown exception here produced a
+        // silent, permanent "funds debited, no service, no refund, not
+        // even flagged for staff" state, on top of an uncaught 500 bubbling
+        // to the caller. We don't know whether the supplier actually
+        // received the order before it threw, so per the "never
+        // auto-refund an order whose supplier acceptance is unknown" rule
+        // we move it to STATUS_UNKNOWN — the same safe place a genuine
+        // timeout/ambiguous response already goes — rather than guessing
+        // success or failure.
+        try {
+            $result = $adapter->placeOrder($payload);
+        } catch (\Throwable $e) {
+            $order->supplierOrders()->create([
+                'supplier_id' => $supplier->id,
+                'supplier_reference' => null,
+                'status' => 'unknown',
+                'request_payload' => $payload,
+                'response_payload' => ['exception' => $e->getMessage()],
+                'submitted_at' => now(),
+                'last_checked_at' => now(),
+            ]);
+
+            $this->markUnknown($order, 'Supplier call raised an exception before responding.');
+
+            return;
+        }
 
         $supplierOrder = $order->supplierOrders()->create([
             'supplier_id' => $supplier->id,
@@ -191,7 +225,15 @@ class OrderEngine
         $order->recordEvent('finalized', ['result' => 'success']);
     }
 
-    private function finalizeFailure(Order $order, string $reason): void
+    /**
+     * Visibility: public (AUDIT FIX, BUG-011, P0, Phase 2.2) — was private.
+     * ReconcileUnknownSupplierOrders needs to resolve a previously-unknown
+     * order to a confirmed failure (with its automatic, now-safe refund)
+     * through this exact same controlled path, rather than duplicating its
+     * logic or — as it did before this fix — silently doing nothing. See
+     * that class for the call site and the bug this closes.
+     */
+    public function finalizeFailure(Order $order, string $reason): void
     {
         $order->update(['status' => Order::STATUS_FAILED, 'completed_at' => now()]);
         $order->recordEvent('finalized', ['result' => 'failed', 'reason' => $reason]);

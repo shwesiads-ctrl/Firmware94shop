@@ -34,7 +34,15 @@ class DepositService
             'amount' => $amount,
             'currency' => 'USD',
             'network' => $network,
-            'transaction_hash' => $transactionHash,
+            // PHASE 2.2 (BUG-008, P1): normalize before persisting so that
+            // the DB-level dedupe key added in
+            // 2026_01_01_000100_add_transaction_hash_dedupe_to_deposits_table
+            // actually catches the same on-chain transaction resubmitted
+            // with different case or incidental whitespace. Normalization
+            // happens here, at write time, rather than only in the
+            // generated column, so the raw stored value and the dedupe key
+            // agree and nothing downstream has to re-derive it.
+            'transaction_hash' => $this->normalizeTransactionHash($transactionHash),
             'proof_path' => $proofPath,
             'status' => Deposit::STATUS_PENDING,
         ]);
@@ -107,5 +115,22 @@ class DepositService
     public function proofUrl(Deposit $deposit): ?string
     {
         return $deposit->proof_path ? Storage::disk('payment_proofs')->path($deposit->proof_path) : null;
+    }
+
+    /**
+     * Lower-case and trim a user-submitted transaction hash. Does not
+     * validate format (network-specific hash shapes vary); only removes the
+     * case/whitespace variance that would otherwise defeat the dedupe key.
+     * Returns null unchanged for an absent hash (manual/no-hash deposits).
+     */
+    private function normalizeTransactionHash(?string $transactionHash): ?string
+    {
+        if ($transactionHash === null) {
+            return null;
+        }
+
+        $trimmed = trim($transactionHash);
+
+        return $trimmed === '' ? null : strtolower($trimmed);
     }
 }

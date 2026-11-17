@@ -72,6 +72,20 @@ class DhruCompatibleController
 
     private function placeOrder(Request $request, ApiCredential $credential)
     {
+        // AUDIT FIX (BUG-015, P1, Phase 2.2): the REST v1 OrderController
+        // requires the `orders.create` scope before placing an order
+        // (OrderController::store()); this DHRU-compatible equivalent
+        // called the exact same OrderEngine::placeOrder() with no scope
+        // check at all. A credential deliberately minted WITHOUT
+        // `orders.create` (e.g. a read-only integration key) could not
+        // place an order through /api/v1/orders, but could place one
+        // through /api/index.php with the identical key — an
+        // authorization bypass via the alternate API surface. Both inbound
+        // APIs now enforce the same rule for the same action.
+        if (! $credential->hasScope('orders.create')) {
+            return response()->json(['STATUS' => 'error', 'ERROR' => 'This API key does not have the orders.create scope.'], 403);
+        }
+
         $request->validate(['id' => ['required', 'exists:services,id'], 'imei' => ['required', 'string']]);
 
         $service = Service::findOrFail($request->input('id'));

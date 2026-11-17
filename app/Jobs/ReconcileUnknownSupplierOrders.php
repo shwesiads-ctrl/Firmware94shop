@@ -57,9 +57,18 @@ class ReconcileUnknownSupplierOrders implements ShouldQueue
                     $order->update(['status' => Order::STATUS_SUCCESS, 'completed_at' => now()]);
                     $order->recordEvent('finalized', ['result' => 'success', 'via' => 'reconciliation']);
                 } else {
-                    // Confirmed failure now known -> safe to resolve via the
-                    // same controlled path OrderEngine uses for a direct failure.
-                    app(\App\Services\Orders\OrderEngine::class);
+                    // AUDIT FIX (BUG-011, P0, Phase 2.2): this branch used to
+                    // resolve an OrderEngine instance from the container and
+                    // do absolutely nothing with it — a no-op. The order was
+                    // left at STATUS_UNKNOWN forever and the customer was
+                    // never refunded even once the supplier had positively
+                    // confirmed the order failed. Now that we have a
+                    // CONFIRMED (isFinal()) failure from the supplier — not
+                    // a guess — it is safe to run it through the exact same
+                    // controlled refund path OrderEngine uses for a direct,
+                    // synchronous failure.
+                    app(\App\Services\Orders\OrderEngine::class)
+                        ->finalizeFailure($order, 'Confirmed failed by reconciliation: '.($result->message ?? 'supplier reported failure.'));
                     $order->recordEvent('status_updated', ['result' => 'failed_confirmed_by_reconciliation']);
                 }
             });
