@@ -3,6 +3,7 @@
 namespace App\Services\Wallet;
 
 use App\Exceptions\InsufficientBalanceException;
+use App\Exceptions\InvalidWalletAmountException;
 use App\Exceptions\WalletOwnershipException;
 use App\Models\Wallet;
 use App\Models\WalletHold;
@@ -24,6 +25,21 @@ class WalletService
 {
     public function debit(Wallet $wallet, string $amount, string $idempotencyKey, ?Model $reference = null, ?string $description = null): WalletTransaction
     {
+        // AUDIT FIX (BUG-009, P1, Phase 2.2): bccomp()/bcsub() treat a
+        // negative $amount as a smaller-than-anything value, so the
+        // "insufficient balance" check below never fires for it, and
+        // bcsub($balance, $amount) with a negative $amount *adds* to the
+        // balance while the ledger row is still posted with type=debit.
+        // Every current caller happens to pass a validated positive amount
+        // (HTTP-layer `min:1` validation for deposits; admin-configured
+        // service/pricing-rule values for orders), but nothing in this
+        // class itself enforced that invariant — a single misconfigured
+        // pricing rule (e.g. a negative `adjustment_value`) would have
+        // silently credited a customer's wallet through what every log and
+        // ledger entry calls a "debit". Guard it here, once, for every
+        // caller present and future.
+        $this->assertPositiveAmount($amount);
+
         return DB::transaction(function () use ($wallet, $amount, $idempotencyKey, $reference, $description) {
             if ($existing = WalletTransaction::where('idempotency_key', $idempotencyKey)->first()) {
                 // AUDIT FIX (BUG-002, P1, Phase 2.1): the replay check used
@@ -60,6 +76,9 @@ class WalletService
 
     public function credit(Wallet $wallet, string $amount, string $idempotencyKey, ?Model $reference = null, ?string $description = null, string $type = 'credit'): WalletTransaction
     {
+        // AUDIT FIX (BUG-009, P1, Phase 2.2) — same reasoning as debit() above.
+        $this->assertPositiveAmount($amount);
+
         return DB::transaction(function () use ($wallet, $amount, $idempotencyKey, $reference, $description, $type) {
             if ($existing = WalletTransaction::where('idempotency_key', $idempotencyKey)->first()) {
                 // See the matching comment in debit() above — AUDIT FIX (BUG-002).
@@ -94,6 +113,11 @@ class WalletService
 
     public function hold(Wallet $wallet, string $amount, ?Model $reference = null): WalletHold
     {
+        // AUDIT FIX (BUG-009, P1, Phase 2.2) — same reasoning as debit() above:
+        // a negative $amount would reduce locked_balance instead of raising
+        // it, silently freeing capacity rather than reserving it.
+        $this->assertPositiveAmount($amount);
+
         return DB::transaction(function () use ($wallet, $amount, $reference) {
             /** @var Wallet $locked */
             $locked = Wallet::lockForUpdate()->findOrFail($wallet->id);
@@ -128,6 +152,22 @@ class WalletService
 
             $hold->update(['status' => 'released', 'released_at' => now()]);
         });
+    }
+
+    /**
+     * Every wallet mutation amount must be a strictly positive magnitude;
+     * direction is conveyed solely by which method is called / which `type`
+     * is recorded (AUDIT FIX, BUG-009, P1, Phase 2.2). Zero is rejected too:
+     * a zero-amount "debit" or "credit" is never a legitimate financial
+     * event and would otherwise post a meaningless ledger row.
+     */
+    private function assertPositiveAmount(string $amount): void
+    {
+        if (bccomp($amount, '0', 4) <= 0) {
+            throw new InvalidWalletAmountException(
+                "Wallet amount must be strictly positive; got [{$amount}]."
+            );
+        }
     }
 
     private function postLedgerRow(Wallet $wallet, string $type, string $amount, string $idempotencyKey, ?Model $reference, ?string $description): WalletTransaction
