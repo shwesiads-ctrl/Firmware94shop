@@ -2,6 +2,8 @@
 
 namespace App\Api\Inbound\DhruCompatible;
 
+use App\Exceptions\DuplicateOrderException;
+use App\Exceptions\InsufficientBalanceException;
 use App\Models\ApiCredential;
 use App\Models\Order;
 use App\Models\Service;
@@ -75,6 +77,10 @@ class DhruCompatibleController
         $service = Service::findOrFail($request->input('id'));
         $idempotencyKey = $request->input('idempotency_key') ?: 'dhru:'.$credential->id.':'.$request->input('imei').':'.$request->input('id');
 
+        // AUDIT FIX (BUG-003 / BUG-004, Phase 2.1) — same rationale as the
+        // REST v1 OrderController: these are expected outcomes, not server
+        // faults, and must come back in the documented DHRU error shape
+        // rather than an unhandled exception.
         try {
             $order = $this->orderEngine->placeOrder(
                 $credential->user,
@@ -86,6 +92,16 @@ class DhruCompatibleController
             );
         } catch (ValidationException $e) {
             return response()->json(['STATUS' => 'error', 'ERROR' => $e->getMessage()], 422);
+        } catch (InsufficientBalanceException $e) {
+            return response()->json(['STATUS' => 'error', 'ERROR' => 'Insufficient wallet balance.'], 402);
+        } catch (DuplicateOrderException $e) {
+            $order = Order::where('idempotency_key', $idempotencyKey)
+                ->where('user_id', $credential->user_id)
+                ->first();
+
+            if (! $order) {
+                return response()->json(['STATUS' => 'error', 'ERROR' => 'Duplicate order request could not be resolved.'], 409);
+            }
         }
 
         return response()->json([

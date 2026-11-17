@@ -54,8 +54,25 @@ class OrderEngine
             throw ValidationException::withMessages(['user' => 'This account is suspended and cannot place orders.']);
         }
 
-        // Idempotency: replaying the same key returns the existing order untouched.
+        // Idempotency: replaying the same key returns the existing order
+        // untouched — but ONLY to the user who originally created it.
+        //
+        // AUDIT FIX (BUG-001, P0, Phase 2.1): this lookup used to match on
+        // idempotency_key alone, with no ownership check. Since the REST v1
+        // API lets any caller supply an arbitrary idempotency_key string
+        // (see OrderController::store), a second user who submitted — or
+        // simply guessed/reused — the same key as someone else's order would
+        // have that other user's Order object (price, status, service,
+        // order_number) returned to them. That's a cross-user information
+        // disclosure via idempotency key reuse. We now fail safely with a
+        // validation error instead of ever returning another user's order.
         if ($existing = Order::where('idempotency_key', $idempotencyKey)->first()) {
+            if ($existing->user_id !== $user->id) {
+                throw ValidationException::withMessages([
+                    'idempotency_key' => 'This idempotency key is already in use by another order.',
+                ]);
+            }
+
             return $existing;
         }
 
@@ -72,7 +89,18 @@ class OrderEngine
 
         // 5 & 6 & 7: check balance, create order, debit wallet — one DB transaction.
         $order = DB::transaction(function () use ($user, $service, $inputs, $idempotencyKey, $price, $placedVia, $apiCredential) {
-            if (Order::where('idempotency_key', $idempotencyKey)->lockForUpdate()->exists()) {
+            // Re-check for a race between two concurrent requests with the
+            // same key (the first check above is outside this transaction).
+            // Locked and scoped by user_id for the same reason as above.
+            $racingOrder = Order::where('idempotency_key', $idempotencyKey)->lockForUpdate()->first();
+
+            if ($racingOrder) {
+                if ($racingOrder->user_id !== $user->id) {
+                    throw ValidationException::withMessages([
+                        'idempotency_key' => 'This idempotency key is already in use by another order.',
+                    ]);
+                }
+
                 throw new DuplicateOrderException("Order with idempotency key [{$idempotencyKey}] already exists.");
             }
 

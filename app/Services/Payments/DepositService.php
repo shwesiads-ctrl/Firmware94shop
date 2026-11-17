@@ -42,11 +42,23 @@ class DepositService
 
     public function approve(Deposit $deposit, User $admin, ?string $note = null): Deposit
     {
-        if ($deposit->status !== Deposit::STATUS_PENDING) {
-            throw new RuntimeException('Only a pending deposit can be approved.');
-        }
-
         return DB::transaction(function () use ($deposit, $admin, $note) {
+            // AUDIT FIX (BUG-006, P1, Phase 2.1): the pending-status check
+            // used to run before the transaction opened and before any row
+            // lock was taken. Two concurrent approve requests for the same
+            // deposit (a double-click, a retried webhook/form submit, or two
+            // admins acting at once) could both read status=pending before
+            // either one's UPDATE committed, and both would then credit the
+            // wallet — a double credit for a single real-world deposit. The
+            // check now happens only after lockForUpdate() has the row, so
+            // the second concurrent caller sees the already-approved status
+            // and is rejected instead of crediting twice.
+            $deposit = Deposit::lockForUpdate()->findOrFail($deposit->id);
+
+            if ($deposit->status !== Deposit::STATUS_PENDING) {
+                throw new RuntimeException('Only a pending deposit can be approved.');
+            }
+
             $deposit->update([
                 'status' => Deposit::STATUS_APPROVED,
                 'reviewed_by' => $admin->id,
@@ -71,20 +83,25 @@ class DepositService
 
     public function reject(Deposit $deposit, User $admin, string $note): Deposit
     {
-        if ($deposit->status !== Deposit::STATUS_PENDING) {
-            throw new RuntimeException('Only a pending deposit can be rejected.');
-        }
+        // Same lock-then-check pattern as approve() — AUDIT FIX (BUG-006).
+        return DB::transaction(function () use ($deposit, $admin, $note) {
+            $deposit = Deposit::lockForUpdate()->findOrFail($deposit->id);
 
-        $deposit->update([
-            'status' => Deposit::STATUS_REJECTED,
-            'reviewed_by' => $admin->id,
-            'reviewed_at' => now(),
-            'admin_note' => $note,
-        ]);
+            if ($deposit->status !== Deposit::STATUS_PENDING) {
+                throw new RuntimeException('Only a pending deposit can be rejected.');
+            }
 
-        AuditLogger::record('deposit.rejected', $deposit, [], ['note' => $note]);
+            $deposit->update([
+                'status' => Deposit::STATUS_REJECTED,
+                'reviewed_by' => $admin->id,
+                'reviewed_at' => now(),
+                'admin_note' => $note,
+            ]);
 
-        return $deposit;
+            AuditLogger::record('deposit.rejected', $deposit, [], ['note' => $note]);
+
+            return $deposit;
+        });
     }
 
     public function proofUrl(Deposit $deposit): ?string

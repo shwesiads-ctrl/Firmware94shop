@@ -3,6 +3,7 @@
 namespace App\Services\Wallet;
 
 use App\Exceptions\InsufficientBalanceException;
+use App\Exceptions\WalletOwnershipException;
 use App\Models\Wallet;
 use App\Models\WalletHold;
 use App\Models\WalletTransaction;
@@ -25,6 +26,21 @@ class WalletService
     {
         return DB::transaction(function () use ($wallet, $amount, $idempotencyKey, $reference, $description) {
             if ($existing = WalletTransaction::where('idempotency_key', $idempotencyKey)->first()) {
+                // AUDIT FIX (BUG-002, P1, Phase 2.1): the replay check used
+                // to return whatever row matched the idempotency key, with
+                // no check that it belonged to the SAME wallet the caller
+                // asked to debit. Every caller in this codebase namespaces
+                // its keys well enough that this should never legitimately
+                // fire, but if it ever did (a bug elsewhere, or a key
+                // collision), silently handing back another wallet's
+                // transaction would be a cross-account ledger leak. Fail
+                // loudly instead.
+                if ($existing->wallet_id !== $wallet->id) {
+                    throw new WalletOwnershipException(
+                        "Idempotency key [{$idempotencyKey}] is already used on wallet #{$existing->wallet_id}, not wallet #{$wallet->id}."
+                    );
+                }
+
                 return $existing;
             }
 
@@ -46,6 +62,13 @@ class WalletService
     {
         return DB::transaction(function () use ($wallet, $amount, $idempotencyKey, $reference, $description, $type) {
             if ($existing = WalletTransaction::where('idempotency_key', $idempotencyKey)->first()) {
+                // See the matching comment in debit() above — AUDIT FIX (BUG-002).
+                if ($existing->wallet_id !== $wallet->id) {
+                    throw new WalletOwnershipException(
+                        "Idempotency key [{$idempotencyKey}] is already used on wallet #{$existing->wallet_id}, not wallet #{$wallet->id}."
+                    );
+                }
+
                 return $existing;
             }
 
