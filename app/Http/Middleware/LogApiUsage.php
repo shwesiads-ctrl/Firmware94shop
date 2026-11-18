@@ -10,6 +10,8 @@ class LogApiUsage
 {
     public function handle(Request $request, Closure $next)
     {
+        // Tests/queue requests may not define the public index.php LARAVEL_START constant.
+        $startedAt = microtime(true);
         $response = $next($request);
 
         // Fire-and-forget; usage logging must never block or fail the request.
@@ -20,7 +22,7 @@ class LogApiUsage
                 'method' => $request->method(),
                 'path' => $request->path(),
                 'status_code' => $response->getStatusCode(),
-                'response_time_ms' => (int) ((microtime(true) - LARAVEL_START) * 1000),
+                'response_time_ms' => max(0, (int) ((microtime(true) - $startedAt) * 1000)),
             ]);
         } catch (\Throwable $e) {
             report($e);
