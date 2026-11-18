@@ -42,49 +42,67 @@ class DepositService
 
     public function approve(Deposit $deposit, User $admin, ?string $note = null): Deposit
     {
-        if ($deposit->status !== Deposit::STATUS_PENDING) {
-            throw new RuntimeException('Only a pending deposit can be approved.');
-        }
-
         return DB::transaction(function () use ($deposit, $admin, $note) {
-            $deposit->update([
+            // Lock and re-read inside the transaction; concurrent approvals/rejections
+            // must never both succeed or credit the wallet twice.
+            $locked = Deposit::query()->lockForUpdate()->findOrFail($deposit->id);
+
+            if ($locked->status !== Deposit::STATUS_PENDING) {
+                throw new RuntimeException('Only a pending deposit can be approved.');
+            }
+
+            $wallet = $locked->user->wallet;
+
+            if (! $wallet || strtoupper((string) $wallet->currency) !== strtoupper((string) $locked->currency)) {
+                throw new RuntimeException('Deposit and wallet currencies differ. Manual conversion is required.');
+            }
+
+            if (bccomp((string) $locked->amount, '0', 4) <= 0) {
+                throw new RuntimeException('A deposit must have a positive amount.');
+            }
+
+            $this->wallets->credit(
+                $wallet,
+                (string) $locked->amount,
+                "deposit-credit:{$locked->id}",
+                $locked,
+                "Deposit #{$locked->id} approved",
+                'deposit'
+            );
+
+            $locked->update([
                 'status' => Deposit::STATUS_APPROVED,
                 'reviewed_by' => $admin->id,
                 'reviewed_at' => now(),
                 'admin_note' => $note,
             ]);
 
-            $this->wallets->credit(
-                $deposit->user->wallet,
-                (string) $deposit->amount,
-                "deposit-credit:{$deposit->id}",
-                $deposit,
-                "Deposit #{$deposit->id} approved",
-                'deposit'
-            );
+            AuditLogger::record('deposit.approved', $locked, [], ['amount' => (string) $locked->amount]);
 
-            AuditLogger::record('deposit.approved', $deposit, [], ['amount' => (string) $deposit->amount]);
-
-            return $deposit;
+            return $locked;
         });
     }
 
     public function reject(Deposit $deposit, User $admin, string $note): Deposit
     {
-        if ($deposit->status !== Deposit::STATUS_PENDING) {
-            throw new RuntimeException('Only a pending deposit can be rejected.');
-        }
+        return DB::transaction(function () use ($deposit, $admin, $note) {
+            $locked = Deposit::query()->lockForUpdate()->findOrFail($deposit->id);
 
-        $deposit->update([
-            'status' => Deposit::STATUS_REJECTED,
-            'reviewed_by' => $admin->id,
-            'reviewed_at' => now(),
-            'admin_note' => $note,
-        ]);
+            if ($locked->status !== Deposit::STATUS_PENDING) {
+                throw new RuntimeException('Only a pending deposit can be rejected.');
+            }
 
-        AuditLogger::record('deposit.rejected', $deposit, [], ['note' => $note]);
+            $locked->update([
+                'status' => Deposit::STATUS_REJECTED,
+                'reviewed_by' => $admin->id,
+                'reviewed_at' => now(),
+                'admin_note' => $note,
+            ]);
 
-        return $deposit;
+            AuditLogger::record('deposit.rejected', $locked, [], ['note' => $note]);
+
+            return $locked;
+        });
     }
 
     public function proofUrl(Deposit $deposit): ?string

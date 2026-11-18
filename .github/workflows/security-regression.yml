@@ -1,0 +1,27 @@
+name: Laravel Security Regression
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+          extensions: bcmath, mbstring, pdo_sqlite, sqlite3, curl, xml, dom, fileinfo
+          tools: composer:v2
+      - name: Prepare Laravel writable folders
+        run: mkdir -p bootstrap/cache storage/framework/cache/data storage/framework/sessions storage/framework/views storage/logs
+      - run: composer install --prefer-dist --no-interaction --no-progress
+      - run: |
+          cp .env.example .env
+          php artisan key:generate
+      - run: php artisan test --no-ansi

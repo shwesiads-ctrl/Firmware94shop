@@ -4,19 +4,17 @@ namespace App\Jobs;
 
 use App\Integrations\Suppliers\SupplierManager;
 use App\Models\Order;
+use App\Services\Orders\OrderEngine;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Throwable;
 
 /**
- * Re-checks every order stuck in Order::STATUS_UNKNOWN by re-querying the
- * supplier's getOrderStatus() where that capability exists. It only ever
- * moves an order OUT of "unknown" on a confirmed success or failure from the
- * supplier — it never guesses and never auto-refunds (master prompt §5
- * Module I: "Never automatically refund an order whose supplier acceptance
- * is unknown").
+ * Status-only reconciliation. Never re-submit an unknown order to supplier.
+ * Confirmed failure passes through OrderEngine's atomic refund path.
  */
 class ReconcileUnknownSupplierOrders implements ShouldQueue
 {
@@ -26,42 +24,36 @@ class ReconcileUnknownSupplierOrders implements ShouldQueue
     {
     }
 
-    public function handle(SupplierManager $suppliers): void
+    public function handle(SupplierManager $suppliers, OrderEngine $orders): void
     {
         Order::where('status', Order::STATUS_UNKNOWN)
-            ->latest('updated_at')
+            ->oldest('updated_at')
             ->limit($this->limit)
             ->get()
-            ->each(function (Order $order) use ($suppliers) {
+            ->each(function (Order $order) use ($suppliers, $orders) {
                 $supplierOrder = $order->supplierOrders()->latest()->first();
 
                 if (! $supplierOrder || ! $supplierOrder->supplier_reference) {
-                    return; // nothing to re-check yet; leave for manual staff review
+                    return; // Manual review required
                 }
 
-                $adapter = $suppliers->for($supplierOrder->supplier->slug);
+                try {
+                    $adapter = $suppliers->for($supplierOrder->supplier->slug);
+                    if (! $adapter->supports('getOrderStatus')) {
+                        return;
+                    }
 
-                if (! $adapter->supports('getOrderStatus')) {
-                    return;
-                }
-
-                $result = $adapter->getOrderStatus($supplierOrder->supplier_reference);
-
-                if (! $result->isFinal()) {
-                    return; // still ambiguous — try again next run
+                    $result = $adapter->getOrderStatus($supplierOrder->supplier_reference);
+                    if (! $result->isFinal()) {
+                        return;
+                    }
+                } catch (Throwable $e) {
+                    report($e);
+                    return; // Stay UNKNOWN; never guess acceptance or refund
                 }
 
                 $supplierOrder->update(['status' => $result->status, 'last_checked_at' => now()]);
-
-                if ($result->isSuccessful()) {
-                    $order->update(['status' => Order::STATUS_SUCCESS, 'completed_at' => now()]);
-                    $order->recordEvent('finalized', ['result' => 'success', 'via' => 'reconciliation']);
-                } else {
-                    // Confirmed failure now known -> safe to resolve via the
-                    // same controlled path OrderEngine uses for a direct failure.
-                    app(\App\Services\Orders\OrderEngine::class);
-                    $order->recordEvent('status_updated', ['result' => 'failed_confirmed_by_reconciliation']);
-                }
+                $orders->resolveConfirmedSupplierResult($order, $result);
             });
     }
 }

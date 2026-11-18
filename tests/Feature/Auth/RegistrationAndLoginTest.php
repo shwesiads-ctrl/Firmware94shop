@@ -3,6 +3,10 @@
 use App\Models\User;
 use Illuminate\Support\Facades\Hash;
 
+beforeEach(function () {
+    $this->seed(\Database\Seeders\RolePermissionSeeder::class);
+});
+
 test('a visitor can register and is assigned the customer role with a zero-balance wallet', function () {
     $response = $this->post('/register', [
         'name' => 'Jane Reseller',

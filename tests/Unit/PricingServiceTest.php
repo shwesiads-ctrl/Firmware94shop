@@ -8,6 +8,10 @@ use App\Services\Pricing\PricingService;
 
 uses(\Illuminate\Foundation\Testing\RefreshDatabase::class);
 
+beforeEach(function () {
+    $this->seed(\Database\Seeders\RolePermissionSeeder::class);
+});
+
 test('a service with no pricing rule charges its base price', function () {
     $service = Service::factory()->create(['service_category_id' => ServiceCategory::factory(), 'base_price' => 10]);
     $user = User::factory()->create();

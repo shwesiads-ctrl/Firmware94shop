@@ -5,6 +5,8 @@ namespace App\Http\Controllers\Auth;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\RateLimiter;
+use Illuminate\Validation\ValidationException;
 
 class AuthenticatedSessionController
 {
@@ -20,7 +22,18 @@ class AuthenticatedSessionController
             'password' => ['required'],
         ]);
 
+        // Per-account + IP throttling makes both targeted attacks and accidental
+        // repeated failures less effective without exposing whether an email exists.
+        $key = 'f94-login:'.hash('sha256', strtolower(trim($credentials['email'])).'|'.$request->ip());
+
+        if (RateLimiter::tooManyAttempts($key, 5)) {
+            throw ValidationException::withMessages([
+                'email' => 'Too many login attempts. Please try again later.',
+            ]);
+        }
+
         if (! Auth::attempt($credentials, $request->boolean('remember'))) {
+            RateLimiter::hit($key, 900);
             $this->recordLoginHistory($request, successful: false);
 
             return back()->withErrors(['email' => __('auth.failed')])->onlyInput('email');
@@ -35,6 +48,7 @@ class AuthenticatedSessionController
             return back()->withErrors(['email' => __('auth.suspended')]);
         }
 
+        RateLimiter::clear($key);
         $user->forceFill(['last_login_at' => now(), 'last_login_ip' => $request->ip()])->save();
         $this->recordLoginHistory($request, successful: true);
 

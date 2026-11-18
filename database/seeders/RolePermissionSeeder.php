@@ -31,7 +31,7 @@ class RolePermissionSeeder extends Seeder
             'admin' => $permissions,
             'staff' => [
                 'users.view', 'suppliers.view', 'services.view', 'orders.view',
-                'orders.manage', 'wallet.view', 'payments.approve', 'reports.view',
+                'orders.manage', 'wallet.view', 'reports.view',
             ],
             'distributor' => ['services.view', 'orders.view', 'orders.manage', 'wallet.view'],
             'reseller' => ['services.view', 'orders.view', 'orders.manage', 'wallet.view', 'api.manage'],
