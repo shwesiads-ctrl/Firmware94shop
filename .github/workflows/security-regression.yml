@@ -18,6 +18,8 @@ jobs:
           coverage: none
           extensions: bcmath, mbstring, pdo_sqlite, sqlite3, curl, xml, dom, fileinfo
           tools: composer:v2
+      - name: Prepare Laravel writable folders
+        run: mkdir -p bootstrap/cache storage/framework/cache/data storage/framework/sessions storage/framework/views storage/logs
       - run: composer install --prefer-dist --no-interaction --no-progress
       - run: |
           cp .env.example .env
