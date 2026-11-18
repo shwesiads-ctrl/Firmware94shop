@@ -9,8 +9,9 @@ use Illuminate\Http\Request;
 
 class DepositReviewController
 {
-    public function index()
+    public function index(Request $request)
     {
+        $this->authorizeStaff($request);
         return view('admin.deposits.index', [
             'deposits' => Deposit::with(['user', 'paymentMethod'])->latest()->paginate(20),
         ]);
@@ -35,6 +36,6 @@ class DepositReviewController
 
     private function authorizeStaff(Request $request): void
     {
-        abort_unless($request->user()->can('payments.approve'), 403);
+        abort_unless($request->user()->hasAnyRole(['admin', 'super-admin']) && $request->user()->can('payments.approve'), 403);
     }
 }

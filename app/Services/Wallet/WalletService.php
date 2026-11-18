@@ -8,6 +8,8 @@ use App\Models\WalletHold;
 use App\Models\WalletTransaction;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\DB;
+use InvalidArgumentException;
+use LogicException;
 
 /**
  * All wallet mutations go through here and nowhere else. Every mutation:
@@ -23,13 +25,15 @@ class WalletService
 {
     public function debit(Wallet $wallet, string $amount, string $idempotencyKey, ?Model $reference = null, ?string $description = null): WalletTransaction
     {
-        return DB::transaction(function () use ($wallet, $amount, $idempotencyKey, $reference, $description) {
-            if ($existing = WalletTransaction::where('idempotency_key', $idempotencyKey)->first()) {
-                return $existing;
-            }
+        $this->assertAmount($amount);
 
+        return DB::transaction(function () use ($wallet, $amount, $idempotencyKey, $reference, $description) {
             /** @var Wallet $locked */
             $locked = Wallet::lockForUpdate()->findOrFail($wallet->id);
+
+            if ($existing = $this->matchingExisting($locked, 'debit', $amount, $idempotencyKey, $reference)) {
+                return $existing;
+            }
 
             if (bccomp($locked->availableBalance(), $amount, 4) < 0) {
                 throw new InsufficientBalanceException('Wallet balance is insufficient for this debit.');
@@ -44,13 +48,19 @@ class WalletService
 
     public function credit(Wallet $wallet, string $amount, string $idempotencyKey, ?Model $reference = null, ?string $description = null, string $type = 'credit'): WalletTransaction
     {
-        return DB::transaction(function () use ($wallet, $amount, $idempotencyKey, $reference, $description, $type) {
-            if ($existing = WalletTransaction::where('idempotency_key', $idempotencyKey)->first()) {
-                return $existing;
-            }
+        $this->assertAmount($amount);
 
+        if (! in_array($type, ['credit', 'deposit', 'refund', 'reversal'], true)) {
+            throw new InvalidArgumentException('Unsupported credit transaction type.');
+        }
+
+        return DB::transaction(function () use ($wallet, $amount, $idempotencyKey, $reference, $description, $type) {
             /** @var Wallet $locked */
             $locked = Wallet::lockForUpdate()->findOrFail($wallet->id);
+
+            if ($existing = $this->matchingExisting($locked, $type, $amount, $idempotencyKey, $reference)) {
+                return $existing;
+            }
             $locked->balance = bcadd((string) $locked->balance, $amount, 4);
             $locked->save();
 
@@ -71,6 +81,8 @@ class WalletService
 
     public function hold(Wallet $wallet, string $amount, ?Model $reference = null): WalletHold
     {
+        $this->assertAmount($amount);
+
         return DB::transaction(function () use ($wallet, $amount, $reference) {
             /** @var Wallet $locked */
             $locked = Wallet::lockForUpdate()->findOrFail($wallet->id);
@@ -94,17 +106,52 @@ class WalletService
     public function releaseHold(WalletHold $hold): void
     {
         DB::transaction(function () use ($hold) {
-            if ($hold->status !== 'active') {
+            /** @var Wallet $locked */
+            $locked = Wallet::lockForUpdate()->findOrFail($hold->wallet_id);
+            // Re-read after acquiring the wallet lock. Two concurrent release
+            // requests cannot decrement locked_balance twice.
+            $current = WalletHold::lockForUpdate()->findOrFail($hold->id);
+
+            if ($current->status !== 'active') {
                 return;
             }
 
-            /** @var Wallet $locked */
-            $locked = Wallet::lockForUpdate()->findOrFail($hold->wallet_id);
-            $locked->locked_balance = bcsub((string) $locked->locked_balance, (string) $hold->amount, 4);
+            $locked->locked_balance = bcsub((string) $locked->locked_balance, (string) $current->amount, 4);
             $locked->save();
 
-            $hold->update(['status' => 'released', 'released_at' => now()]);
+            $current->update(['status' => 'released', 'released_at' => now()]);
         });
+    }
+
+    private function assertAmount(string $amount): void
+    {
+        if (! preg_match('/^(?:0|[1-9][0-9]{0,9})(?:\\.[0-9]{1,4})?$/D', $amount) || bccomp($amount, '0', 4) <= 0) {
+            throw new InvalidArgumentException('Wallet amount must be a positive decimal with at most four places.');
+        }
+    }
+
+    private function matchingExisting(
+        Wallet $wallet,
+        string $type,
+        string $amount,
+        string $key,
+        ?Model $reference,
+    ): ?WalletTransaction {
+        $existing = WalletTransaction::where('idempotency_key', $key)->first();
+
+        if (! $existing) {
+            return null;
+        }
+
+        if ((int) $existing->wallet_id !== (int) $wallet->id
+            || $existing->type !== $type
+            || bccomp((string) $existing->amount, $amount, 4) !== 0
+            || $existing->reference_type !== ($reference?->getMorphClass())
+            || ($existing->reference_id === null ? null : (int) $existing->reference_id) !== ($reference?->id === null ? null : (int) $reference->id)) {
+            throw new LogicException('Idempotency key was reused for a different wallet operation.');
+        }
+
+        return $existing;
     }
 
     private function postLedgerRow(Wallet $wallet, string $type, string $amount, string $idempotencyKey, ?Model $reference, ?string $description): WalletTransaction
